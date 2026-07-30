@@ -146,7 +146,7 @@ Write-Host "  Status filter: $StatusFilter"
 $windows = [System.Collections.Generic.List[PSCustomObject]]::new()
 $cursor  = $StartDate
 while ($cursor -lt $EndDate) {
-    $windowEnd = [datetime]::Min($cursor.AddDays(10), $EndDate)
+    $windowEnd = if ($cursor.AddDays(10) -lt $EndDate) { $cursor.AddDays(10) } else { $EndDate }
     $windows.Add([PSCustomObject]@{ Start = $cursor; End = $windowEnd })
     $cursor = $windowEnd
 }
