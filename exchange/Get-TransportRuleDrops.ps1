@@ -209,6 +209,7 @@ foreach ($msg in $allMessages) {
         if ($ruleMatch) {
             $action = ($ruleMatch | Select-Object -First 1).Detail
             $results.Add([PSCustomObject]@{
+                Source    = 'MessageTrace'
                 DateTime  = $msg.Received
                 Sender    = $msg.SenderAddress
                 Recipient = $msg.RecipientAddress
@@ -225,7 +226,44 @@ foreach ($msg in $allMessages) {
 
 Write-Progress -Activity "Checking message detail" -Completed
 
-# ---------- Output ----------
+# ---------- Quarantine lookup (faster than message trace — no propagation delay) ----------
+Write-Host "`nStep 3/3 — Checking quarantine for transport rule matches..." -ForegroundColor Cyan
+try {
+    $quarantineHits = Get-QuarantineMessage -StartReceivedDate $StartDate `
+                                            -EndReceivedDate $EndDate `
+                                            -QuarantineTypes TransportRule `
+                                            -PageSize 1000 `
+                                            -ErrorAction Stop |
+        Where-Object { $_.PolicyName -like "*$RuleName*" }
+
+    if ($quarantineHits -and $quarantineHits.Count -gt 0) {
+        Write-Host "  Found $($quarantineHits.Count) quarantined message(s) matching rule '$RuleName'." -ForegroundColor Gray
+        foreach ($qMsg in $quarantineHits) {
+            # Avoid double-counting messages already found in message trace
+            $alreadyFound = $results | Where-Object {
+                $_.Sender -eq $qMsg.SenderAddress -and
+                $_.Recipient -eq $qMsg.RecipientAddress -and
+                [math]::Abs(($_.DateTime - $qMsg.ReceivedTime).TotalMinutes) -lt 2
+            }
+            if (-not $alreadyFound) {
+                $results.Add([PSCustomObject]@{
+                    Source     = 'Quarantine'
+                    DateTime   = $qMsg.ReceivedTime
+                    Sender     = $qMsg.SenderAddress
+                    Recipient  = $qMsg.RecipientAddress
+                    Subject    = $qMsg.Subject
+                    Status     = 'Quarantined'
+                    RuleAction = $qMsg.PolicyName
+                    MessageId  = $qMsg.Identity
+                })
+            }
+        }
+    } else {
+        Write-Host '  No quarantined messages matched.' -ForegroundColor Gray
+    }
+} catch {
+    Write-Warning "Quarantine lookup failed: $_"
+}
 if ($results.Count -gt 0) {
     $results | Sort-Object DateTime -Descending | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host "`nFound $($results.Count) message(s) affected by rule '$RuleName'." -ForegroundColor Green
@@ -233,10 +271,11 @@ if ($results.Count -gt 0) {
 
     Write-Host "`n--- Most Recent Matches ---" -ForegroundColor Cyan
     $results | Sort-Object DateTime -Descending | Select-Object -First 15 |
-        Format-Table DateTime, Sender, Recipient, Subject, Status -AutoSize
+        Format-Table Source, DateTime, Sender, Recipient, Subject, Status -AutoSize
 } else {
     Write-Host "`nNo messages matched rule '$RuleName' in the specified date range and status filter." -ForegroundColor Yellow
     Write-Host "Tip: Try 'All' as the status filter if the rule silently deletes rather than rejects." -ForegroundColor Gray
+    Write-Host "Tip: If the message was very recent, message trace may not have propagated yet (5-30 min delay)." -ForegroundColor Gray
 }
 
 if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
