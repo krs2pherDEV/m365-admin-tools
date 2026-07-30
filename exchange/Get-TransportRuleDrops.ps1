@@ -92,7 +92,7 @@ $maxLookback = (Get-Date).AddDays(-90)
 
 if (-not $StartDate) {
     do {
-        $raw = (Read-Host "`nStart date (e.g. 2026-07-01, max 90 days ago)").Trim()
+        $raw = (Read-Host "`nStart date and time (e.g. 2026-07-29 11:00, max 90 days ago)").Trim()
         $parsed = [datetime]::MinValue
         $valid  = [datetime]::TryParse($raw, [ref]$parsed) -and $parsed -ge $maxLookback -and $parsed -lt (Get-Date)
         if (-not $valid) { Write-Host "  Enter a valid date within the last 90 days." -ForegroundColor Yellow }
@@ -102,7 +102,7 @@ if (-not $StartDate) {
 
 if (-not $EndDate) {
     do {
-        $raw = (Read-Host "End date   (e.g. 2026-07-30)").Trim()
+        $raw = (Read-Host "End date and time   (e.g. 2026-07-29 12:00)").Trim()
         $parsed = [datetime]::MinValue
         $valid  = [datetime]::TryParse($raw, [ref]$parsed) -and $parsed -gt $StartDate
         if (-not $valid) { Write-Host "  Enter a valid date after the start date." -ForegroundColor Yellow }
