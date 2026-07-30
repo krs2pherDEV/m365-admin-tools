@@ -198,10 +198,10 @@ foreach ($window in $windows) {
 
 Write-Host "  Retrieved $($allMessages.Count) message(s) to inspect." -ForegroundColor Gray
 
-# ---------- Offer 1-day retry for potentially capped windows ----------
+# ---------- Offer retry with smaller splits for potentially capped windows ----------
 if ($cappedWindows.Count -gt 0) {
     Write-Host "`nWARNING: $($cappedWindows.Count) window(s) ended on an exact multiple of 1,000 and may have been capped by Exchange Online." -ForegroundColor Yellow
-    $retry = (Read-Host "Re-query those window(s) in 1-day splits to recover potentially missing messages? [Y/N]").Trim().ToUpper()
+    $retry = (Read-Host "Re-query those window(s) with smaller splits to recover potentially missing messages? [Y/N]").Trim().ToUpper()
 
     if ($retry -eq 'Y') {
         # Build a HashSet of already-collected MessageIds to deduplicate
@@ -211,11 +211,23 @@ if ($cappedWindows.Count -gt 0) {
         $retryMessages = [System.Collections.Generic.List[object]]::new()
 
         foreach ($cappedWindow in $cappedWindows) {
-            Write-Host "  Re-querying $($cappedWindow.Start.ToString('yyyy-MM-dd HH:mm')) - $($cappedWindow.End.ToString('yyyy-MM-dd HH:mm')) in 1-day splits..." -ForegroundColor Cyan
+            $windowSpan = ($cappedWindow.End - $cappedWindow.Start).TotalHours
+
+            # Adaptive split size: >24h -> 1-hour chunks; <=24h -> 10-minute chunks
+            if ($windowSpan -gt 24) {
+                $splitMinutes = 60
+                $splitLabel   = '1-hour'
+            } else {
+                $splitMinutes = 10
+                $splitLabel   = '10-minute'
+            }
+
+            Write-Host "  Re-querying $($cappedWindow.Start.ToString('yyyy-MM-dd HH:mm')) - $($cappedWindow.End.ToString('yyyy-MM-dd HH:mm')) in $splitLabel splits..." -ForegroundColor Cyan
             $subCursor = $cappedWindow.Start
 
             while ($subCursor -lt $cappedWindow.End) {
-                $subEnd   = if ($subCursor.AddDays(1) -lt $cappedWindow.End) { $subCursor.AddDays(1) } else { $cappedWindow.End }
+                $subEnd    = $subCursor.AddMinutes($splitMinutes)
+                if ($subEnd -gt $cappedWindow.End) { $subEnd = $cappedWindow.End }
                 $subWindow = [PSCustomObject]@{ Start = $subCursor; End = $subEnd }
                 $subList   = [System.Collections.Generic.List[object]]::new()
 
@@ -223,7 +235,7 @@ if ($cappedWindows.Count -gt 0) {
                 Write-Host "    $($subCursor.ToString('yyyy-MM-dd HH:mm')) - $($subEnd.ToString('yyyy-MM-dd HH:mm')): $subCount message(s)" -ForegroundColor Gray
 
                 if ($subCount % 1000 -eq 0 -and $subCount -gt 0) {
-                    Write-Host "    ^ Still capped at $subCount. Consider narrowing the date range further." -ForegroundColor Yellow
+                    Write-Host "    ^ Still capped at $subCount. Volume is very high for this window." -ForegroundColor Yellow
                 }
 
                 foreach ($msg in $subList) {
