@@ -153,15 +153,22 @@ while ($cursor -lt $EndDate) {
 Write-Host "  Date windows : $($windows.Count) x ≤10-day window(s)`n" -ForegroundColor Gray
 
 # ---------- Collect messages via paginated trace ----------
-Write-Host 'Step 1/2 — Retrieving messages from Message Trace...' -ForegroundColor Cyan
-$allMessages = [System.Collections.Generic.List[object]]::new()
+Write-Host 'Step 1/2 - Retrieving messages from Message Trace...' -ForegroundColor Cyan
+$allMessages   = [System.Collections.Generic.List[object]]::new()
+$cappedWindows = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-foreach ($window in $windows) {
+function Invoke-TraceWindow {
+    param(
+        [PSCustomObject]$Window,
+        [string]$StatusFilter,
+        [System.Collections.Generic.List[object]]$MessageList
+    )
     $page = 1
+    $windowCount = 0
     do {
         $traceParams = @{
-            StartDate = $window.Start
-            EndDate   = $window.End
+            StartDate = $Window.Start
+            EndDate   = $Window.End
             PageSize  = 1000
             Page      = $page
         }
@@ -169,13 +176,74 @@ foreach ($window in $windows) {
 
         $batch = Get-MessageTrace @traceParams -ErrorAction SilentlyContinue
         if ($batch -and $batch.Count -gt 0) {
-            foreach ($msg in $batch) { $allMessages.Add($msg) }
+            foreach ($msg in $batch) { $MessageList.Add($msg) }
+            $windowCount += $batch.Count
             $page++
         }
     } while ($batch -and $batch.Count -eq 1000)
+
+    return $windowCount
+}
+
+foreach ($window in $windows) {
+    $count = Invoke-TraceWindow -Window $window -StatusFilter $StatusFilter -MessageList $allMessages
+    Write-Host "  Window $($window.Start.ToString('yyyy-MM-dd HH:mm')) - $($window.End.ToString('yyyy-MM-dd HH:mm')): $count message(s)" -ForegroundColor Gray
+
+    # Exact multiple of 1000 means we may have hit Exchange Online's result cap
+    if ($count -gt 0 -and $count % 1000 -eq 0) {
+        Write-Host "    ^ Ended on exactly $count - possible result cap. Will offer retry." -ForegroundColor Yellow
+        $cappedWindows.Add($window)
+    }
 }
 
 Write-Host "  Retrieved $($allMessages.Count) message(s) to inspect." -ForegroundColor Gray
+
+# ---------- Offer 1-day retry for potentially capped windows ----------
+if ($cappedWindows.Count -gt 0) {
+    Write-Host "`nWARNING: $($cappedWindows.Count) window(s) ended on an exact multiple of 1,000 and may have been capped by Exchange Online." -ForegroundColor Yellow
+    $retry = (Read-Host "Re-query those window(s) in 1-day splits to recover potentially missing messages? [Y/N]").Trim().ToUpper()
+
+    if ($retry -eq 'Y') {
+        # Build a HashSet of already-collected MessageIds to deduplicate
+        $knownIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($msg in $allMessages) { [void]$knownIds.Add($msg.MessageId) }
+
+        $retryMessages = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($cappedWindow in $cappedWindows) {
+            Write-Host "  Re-querying $($cappedWindow.Start.ToString('yyyy-MM-dd HH:mm')) - $($cappedWindow.End.ToString('yyyy-MM-dd HH:mm')) in 1-day splits..." -ForegroundColor Cyan
+            $subCursor = $cappedWindow.Start
+
+            while ($subCursor -lt $cappedWindow.End) {
+                $subEnd   = if ($subCursor.AddDays(1) -lt $cappedWindow.End) { $subCursor.AddDays(1) } else { $cappedWindow.End }
+                $subWindow = [PSCustomObject]@{ Start = $subCursor; End = $subEnd }
+                $subList   = [System.Collections.Generic.List[object]]::new()
+
+                $subCount = Invoke-TraceWindow -Window $subWindow -StatusFilter $StatusFilter -MessageList $subList
+                Write-Host "    $($subCursor.ToString('yyyy-MM-dd HH:mm')) - $($subEnd.ToString('yyyy-MM-dd HH:mm')): $subCount message(s)" -ForegroundColor Gray
+
+                if ($subCount % 1000 -eq 0 -and $subCount -gt 0) {
+                    Write-Host "    ^ Still capped at $subCount. Consider narrowing the date range further." -ForegroundColor Yellow
+                }
+
+                foreach ($msg in $subList) {
+                    if ($knownIds.Add($msg.MessageId)) {
+                        $retryMessages.Add($msg)
+                    }
+                }
+                $subCursor = $subEnd
+            }
+        }
+
+        if ($retryMessages.Count -gt 0) {
+            Write-Host "  Recovered $($retryMessages.Count) additional unique message(s) from retry." -ForegroundColor Green
+            foreach ($msg in $retryMessages) { $allMessages.Add($msg) }
+        } else {
+            Write-Host "  No additional messages found in retry (original results were likely complete)." -ForegroundColor Gray
+        }
+    }
+}
+
 
 if ($allMessages.Count -eq 0) {
     Write-Host 'No messages found in the specified date range and status filter.' -ForegroundColor Yellow
