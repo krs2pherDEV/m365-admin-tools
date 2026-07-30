@@ -113,17 +113,34 @@ if ($existingConn) {
     $connectedHere = $true
 }
 
+# ---------- Prompt for rule name filter if not supplied ----------
+if ([string]::IsNullOrWhiteSpace($RuleName)) {
+    $input = (Read-Host "`nEnter a transport rule name to filter by (or press Enter to search all)").Trim()
+    if (-not [string]::IsNullOrWhiteSpace($input)) {
+        $RuleName = $input
+        Write-Host "Filtering results to rules matching: '$RuleName'" -ForegroundColor Cyan
+    } else {
+        Write-Host "No filter applied — returning all transport rule events." -ForegroundColor Gray
+    }
+}
+
 # ---------- Build search parameters ----------
+# Transport rule events are logged under ExchangeAdmin, filtered by Operation name
+$allTransportOps = @(
+    'New-TransportRule',
+    'Set-TransportRule',
+    'Remove-TransportRule',
+    'Enable-TransportRule',
+    'Disable-TransportRule'
+)
+
 $searchParams = @{
-    RecordType     = 'ExchangeTransportRule'
+    RecordType     = 'ExchangeAdmin'
+    Operations     = if ($Operations -and $Operations.Count -gt 0) { $Operations } else { $allTransportOps }
     StartDate      = $StartDate
     EndDate        = $EndDate
     ResultSize     = 5000
     SessionCommand = 'ReturnLargeSet'
-}
-
-if ($Operations -and $Operations.Count -gt 0) {
-    $searchParams['Operations'] = $Operations
 }
 
 # ---------- Paginated UAL search ----------
