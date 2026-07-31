@@ -299,6 +299,11 @@ foreach ($msg in $allMessages) {
                 MessageId = $msg.MessageId
             })
         }
+
+        # Throttle: EXO allows ~3 detail calls/sec sustained; 350ms keeps us under the limit
+        # and avoids the GetResponseHeader crash in the EXO module's 429 retry handler
+        Start-Sleep -Milliseconds 350
+
     } catch {
         Write-Warning "Could not retrieve detail for message $($msg.MessageId): $_"
     }
