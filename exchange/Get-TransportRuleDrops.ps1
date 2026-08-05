@@ -4,33 +4,29 @@
     sender, recipient, subject, date, and action to CSV.
 .DESCRIPTION
     Connects to Exchange Online, prompts for a date range and transport rule name, then
-    queries Message Trace and Message Trace Detail to identify messages affected by the rule.
-    Splits date ranges into 10-day windows automatically (Exchange Online limitation).
+    queries the detailed transport rule report, filtered by the selected rule, to identify
+    messages affected by the rule. Splits the date range into one-day windows and paginates
+    each window automatically.
     Results are exported to a timestamped CSV.
 
-    NOTE: Message Trace supports a maximum lookback of 90 days.
-    NOTE: This script calls Get-MessageTraceDetail for each message in the date range.
-    For large tenants or wide date ranges, use -StatusFilter to narrow results first.
+    NOTE: The detailed transport rule report supports a maximum lookback of 10 days.
 .PARAMETER StartDate
     Start of the search window. Must be within the last 90 days.
 .PARAMETER EndDate
     End of the search window.
 .PARAMETER RuleName
     The transport rule name to search for (partial match supported).
-.PARAMETER StatusFilter
-    Optional. Pre-filter messages by delivery status to reduce API calls.
-    Recommended: 'Failed' for reject rules, 'All' to check every message.
-    Defaults to prompting interactively.
 .PARAMETER AdminUPN
     Admin UPN used to connect if no active Exchange Online session exists.
 .PARAMETER OutputCsv
-    Path for the output CSV. Defaults to .\TransportRuleDrops_<timestamp>.csv
+    Path for the completed output CSV. Results are appended to a sibling .partial.csv
+    file during the search, then renamed to this path after successful completion.
 .PARAMETER TenantEnvironment
     Exchange Online environment. Defaults to USGovGCC.
 .EXAMPLE
     .\Get-TransportRuleDrops.ps1
 .EXAMPLE
-    .\Get-TransportRuleDrops.ps1 -StartDate (Get-Date).AddDays(-7) -RuleName "Block External Fwd" -StatusFilter Failed
+    .\Get-TransportRuleDrops.ps1 -StartDate (Get-Date).AddDays(-7) -RuleName "Block External Fwd"
 #>
 
 #Requires -Modules ExchangeOnlineManagement
@@ -45,10 +41,6 @@ param(
 
     [Parameter()]
     [string]$RuleName,
-
-    [Parameter()]
-    [ValidateSet('All', 'Failed', 'Quarantined', 'FilteredAsSpam')]
-    [string]$StatusFilter,
 
     [Parameter()]
     [string]$AdminUPN,
@@ -88,11 +80,11 @@ if ($existingConn) {
 }
 
 # ---------- Prompt for date range ----------
-$maxLookback = (Get-Date).AddDays(-90)
+$maxLookback = (Get-Date).AddDays(-10)
 
 if (-not $StartDate) {
     do {
-        $raw = (Read-Host "`nStart date and time (e.g. 2026-07-29 11:00, max 90 days ago)").Trim()
+        $raw = (Read-Host "`nStart date and time (e.g. 2026-07-29 11:00, max 10 days ago)").Trim()
         $parsed = [datetime]::MinValue
         $valid  = [datetime]::TryParse($raw, [ref]$parsed) -and $parsed -ge $maxLookback -and $parsed -lt (Get-Date)
         if (-not $valid) { Write-Host "  Enter a valid date within the last 90 days." -ForegroundColor Yellow }
@@ -111,7 +103,7 @@ if (-not $EndDate) {
 }
 
 if ($StartDate -lt $maxLookback) {
-    Write-Error "StartDate cannot be more than 90 days ago (limit: $($maxLookback.ToString('yyyy-MM-dd')))."
+    Write-Error "StartDate cannot be more than 10 days ago (transport rule report limit: $($maxLookback.ToString('yyyy-MM-dd')))."
     if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
     exit 1
 }
@@ -124,243 +116,165 @@ if ([string]::IsNullOrWhiteSpace($RuleName)) {
     } while ([string]::IsNullOrWhiteSpace($RuleName))
 }
 
-# ---------- Prompt for status filter ----------
-if (-not $StatusFilter) {
-    Write-Host "`nStatus filter (reduces API calls for large date ranges):" -ForegroundColor Cyan
-    Write-Host "  [1] All messages (slowest — checks every message)"
-    Write-Host "  [2] Failed only  (fastest — use for reject/block rules)"
-    Write-Host "  [3] Quarantined  (use for quarantine rules)"
-    Write-Host "  [4] FilteredAsSpam"
-    do {
-        $sel = (Read-Host "Selection [1-4]").Trim()
-    } while ($sel -notmatch '^[1-4]$')
-    $StatusFilter = @{ '1' = 'All'; '2' = 'Failed'; '3' = 'Quarantined'; '4' = 'FilteredAsSpam' }[$sel]
+# ---------- Resolve partial rule name to one exact rule ----------
+try {
+    $matchingRules = @(Get-TransportRule -ErrorAction Stop | Where-Object { $_.Name -like "*$RuleName*" })
+} catch {
+    Write-Error "Could not read transport rules: $($_.Exception.Message)"
+    if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+    exit 1
 }
 
-Write-Host "`nSearch parameters:" -ForegroundColor Cyan
-Write-Host "  Date range   : $($StartDate.ToString('yyyy-MM-dd')) to $($EndDate.ToString('yyyy-MM-dd'))"
-Write-Host "  Rule name    : $RuleName"
-Write-Host "  Status filter: $StatusFilter"
+if ($matchingRules.Count -eq 0) {
+    Write-Error "No transport rule matched '$RuleName'."
+    if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+    exit 1
+}
+if ($matchingRules.Count -gt 1) {
+    Write-Host "More than one transport rule matched '$RuleName':" -ForegroundColor Yellow
+    $matchingRules | Sort-Object Name | ForEach-Object { Write-Host "  - $($_.Name)" }
+    Write-Error 'Use a more specific rule name and run the script again.'
+    if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+    exit 1
+}
+$RuleName = $matchingRules[0].Name
 
-# ---------- Split range into <=10-day windows ----------
+Write-Host "`nSearch parameters:" -ForegroundColor Cyan
+Write-Host "  Date range: $($StartDate.ToString('yyyy-MM-dd HH:mm')) to $($EndDate.ToString('yyyy-MM-dd HH:mm'))"
+Write-Host "  Rule name : $RuleName"
+
+# ---------- Split range into one-day windows ----------
 $windows = [System.Collections.Generic.List[PSCustomObject]]::new()
 $cursor  = $StartDate
 while ($cursor -lt $EndDate) {
-    $windowEnd = if ($cursor.AddDays(10) -lt $EndDate) { $cursor.AddDays(10) } else { $EndDate }
+    $windowEnd = if ($cursor.AddDays(1) -lt $EndDate) { $cursor.AddDays(1) } else { $EndDate }
     $windows.Add([PSCustomObject]@{ Start = $cursor; End = $windowEnd })
     $cursor = $windowEnd
 }
-Write-Host "  Date windows : $($windows.Count) x ≤10-day window(s)`n" -ForegroundColor Gray
+Write-Host "  Date windows: $($windows.Count) x one-day window(s)`n" -ForegroundColor Gray
 
-# ---------- Collect messages via paginated trace ----------
-Write-Host 'Step 1/2 - Retrieving messages from Message Trace...' -ForegroundColor Cyan
-$allMessages   = [System.Collections.Generic.List[object]]::new()
-$cappedWindows = [System.Collections.Generic.List[PSCustomObject]]::new()
-
-function Invoke-TraceWindow {
+function Get-FirstPropertyValue {
     param(
-        [PSCustomObject]$Window,
-        [string]$StatusFilter,
-        [System.Collections.Generic.List[object]]$MessageList
+        [object]$InputObject,
+        [string[]]$Names
     )
+    foreach ($name in $Names) {
+        $property = $InputObject.PSObject.Properties[$name]
+        if ($null -ne $property -and $null -ne $property.Value) { return $property.Value }
+    }
+    return $null
+}
+
+# ---------- Retrieve only action hits for the selected rule ----------
+Write-Host "Retrieving transport rule action hits for '$RuleName'..." -ForegroundColor Cyan
+
+$outputDirectory = Split-Path -Parent ([System.IO.Path]::GetFullPath($OutputCsv))
+if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+    Write-Error "Output directory does not exist: $outputDirectory"
+    if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+    exit 1
+}
+
+$outputExtension = [System.IO.Path]::GetExtension($OutputCsv)
+$partialCsv = if ($outputExtension -eq '.csv') {
+    Join-Path $outputDirectory "$([System.IO.Path]::GetFileNameWithoutExtension($OutputCsv)).partial.csv"
+} else {
+    "$([System.IO.Path]::GetFullPath($OutputCsv)).partial.csv"
+}
+Remove-Item -LiteralPath $partialCsv -Force -ErrorAction SilentlyContinue
+
+$csvInitialized = $false
+$resultCount = 0
+$recentResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+$knownResults = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$knownResultOrder = [System.Collections.Generic.Queue[string]]::new()
+$deduplicationCacheSize = 10000
+
+foreach ($window in $windows) {
     $page = 1
     $windowCount = 0
     do {
-        $traceParams = @{
-            StartDate = $Window.Start
-            EndDate   = $Window.End
-            PageSize  = 1000
-            Page      = $page
+        try {
+            $batch = @(Get-MailDetailTransportRuleReport `
+                -StartDate $window.Start `
+                -EndDate $window.End `
+                -TransportRule $RuleName `
+                -EventType TransportRuleActionHits `
+                -Page $page `
+                -PageSize 5000 `
+                -ErrorAction Stop)
+        } catch {
+            $partialMessage = if ($csvInitialized) { " Partial results remain at '$partialCsv'." } else { '' }
+            if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+            throw "Transport rule report failed for $($window.Start.ToString('yyyy-MM-dd HH:mm')) - $($window.End.ToString('yyyy-MM-dd HH:mm')), page $page`: $($_.Exception.Message).$partialMessage"
         }
-        if ($StatusFilter -ne 'All') { $traceParams['Status'] = $StatusFilter }
 
-        $batch = Get-MessageTrace @traceParams -ErrorAction SilentlyContinue
-        if ($batch -and $batch.Count -gt 0) {
-            foreach ($msg in $batch) { $MessageList.Add($msg) }
-            $windowCount += $batch.Count
-            $page++
-        }
-    } while ($batch -and $batch.Count -eq 1000)
-
-    return $windowCount
-}
-
-foreach ($window in $windows) {
-    $count = Invoke-TraceWindow -Window $window -StatusFilter $StatusFilter -MessageList $allMessages
-    Write-Host "  Window $($window.Start.ToString('yyyy-MM-dd HH:mm')) - $($window.End.ToString('yyyy-MM-dd HH:mm')): $count message(s)" -ForegroundColor Gray
-
-    # Exact multiple of 1000 means we may have hit Exchange Online's result cap
-    if ($count -gt 0 -and $count % 1000 -eq 0) {
-        Write-Host "    ^ Ended on exactly $count - possible result cap. Will offer retry." -ForegroundColor Yellow
-        $cappedWindows.Add($window)
-    }
-}
-
-Write-Host "  Retrieved $($allMessages.Count) message(s) to inspect." -ForegroundColor Gray
-
-# ---------- Offer retry with smaller splits for potentially capped windows ----------
-if ($cappedWindows.Count -gt 0) {
-    Write-Host "`nWARNING: $($cappedWindows.Count) window(s) ended on an exact multiple of 1,000 and may have been capped by Exchange Online." -ForegroundColor Yellow
-    $retry = (Read-Host "Re-query those window(s) with smaller splits to recover potentially missing messages? [Y/N]").Trim().ToUpper()
-
-    if ($retry -eq 'Y') {
-        # Build a HashSet of already-collected MessageIds to deduplicate
-        $knownIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($msg in $allMessages) { [void]$knownIds.Add($msg.MessageId) }
-
-        $retryMessages = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($cappedWindow in $cappedWindows) {
-            $windowSpan = ($cappedWindow.End - $cappedWindow.Start).TotalHours
-
-            # Adaptive split size: >24h -> 1-hour chunks; <=24h -> 10-minute chunks
-            if ($windowSpan -gt 24) {
-                $splitMinutes = 60
-                $splitLabel   = '1-hour'
-            } else {
-                $splitMinutes = 10
-                $splitLabel   = '10-minute'
-            }
-
-            Write-Host "  Re-querying $($cappedWindow.Start.ToString('yyyy-MM-dd HH:mm')) - $($cappedWindow.End.ToString('yyyy-MM-dd HH:mm')) in $splitLabel splits..." -ForegroundColor Cyan
-            $subCursor = $cappedWindow.Start
-
-            while ($subCursor -lt $cappedWindow.End) {
-                $subEnd    = $subCursor.AddMinutes($splitMinutes)
-                if ($subEnd -gt $cappedWindow.End) { $subEnd = $cappedWindow.End }
-                $subWindow = [PSCustomObject]@{ Start = $subCursor; End = $subEnd }
-                $subList   = [System.Collections.Generic.List[object]]::new()
-
-                $subCount = Invoke-TraceWindow -Window $subWindow -StatusFilter $StatusFilter -MessageList $subList
-                Write-Host "    $($subCursor.ToString('yyyy-MM-dd HH:mm')) - $($subEnd.ToString('yyyy-MM-dd HH:mm')): $subCount message(s)" -ForegroundColor Gray
-
-                if ($subCount % 1000 -eq 0 -and $subCount -gt 0) {
-                    Write-Host "    ^ Still capped at $subCount. Volume is very high for this window." -ForegroundColor Yellow
+        $pageResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($item in $batch) {
+            $messageTraceId = Get-FirstPropertyValue $item @('MessageTraceId', 'MessageTraceID')
+            $messageId = Get-FirstPropertyValue $item @('MessageId', 'MessageID')
+            $recipient = Get-FirstPropertyValue $item @('RecipientAddress', 'Recipient')
+            $action = Get-FirstPropertyValue $item @('Action', 'EventType')
+            $key = "$messageTraceId|$messageId|$recipient|$action"
+            if ($knownResults.Add($key)) {
+                $knownResultOrder.Enqueue($key)
+                if ($knownResultOrder.Count -gt $deduplicationCacheSize) {
+                    [void]$knownResults.Remove($knownResultOrder.Dequeue())
                 }
-
-                foreach ($msg in $subList) {
-                    if ($knownIds.Add($msg.MessageId)) {
-                        $retryMessages.Add($msg)
-                    }
-                }
-                $subCursor = $subEnd
-            }
-        }
-
-        if ($retryMessages.Count -gt 0) {
-            Write-Host "  Recovered $($retryMessages.Count) additional unique message(s) from retry." -ForegroundColor Green
-            foreach ($msg in $retryMessages) { $allMessages.Add($msg) }
-        } else {
-            Write-Host "  No additional messages found in retry (original results were likely complete)." -ForegroundColor Gray
-        }
-    }
-}
-
-
-if ($allMessages.Count -eq 0) {
-    Write-Host 'No messages found in the specified date range and status filter.' -ForegroundColor Yellow
-    if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
-    exit 0
-}
-
-# ---------- Check each message for the transport rule ----------
-Write-Host "Step 2/2 — Checking message trace detail for rule '$RuleName'..." -ForegroundColor Cyan
-Write-Host '  (This may take several minutes for large result sets.)' -ForegroundColor Gray
-
-$results = [System.Collections.Generic.List[PSCustomObject]]::new()
-$total   = $allMessages.Count
-$index   = 0
-
-foreach ($msg in $allMessages) {
-    $index++
-    Write-Progress -Activity "Checking message detail" `
-        -Status "$index of $total — $($msg.SenderAddress) → $($msg.RecipientAddress)" `
-        -PercentComplete (($index / $total) * 100)
-
-    try {
-        $details = Get-MessageTraceDetail `
-            -MessageId        $msg.MessageId `
-            -RecipientAddress $msg.RecipientAddress `
-            -ErrorAction SilentlyContinue
-
-        # Match any detail event that references the rule name
-        $ruleMatch = $details | Where-Object { $_.Detail -like "*$RuleName*" }
-
-        if ($ruleMatch) {
-            $action = ($ruleMatch | Select-Object -First 1).Detail
-            $results.Add([PSCustomObject]@{
-                Source    = 'MessageTrace'
-                DateTime  = $msg.Received
-                Sender    = $msg.SenderAddress
-                Recipient = $msg.RecipientAddress
-                Subject   = $msg.Subject
-                Status    = $msg.Status
-                RuleAction = $action
-                MessageId = $msg.MessageId
-            })
-        }
-
-        # Throttle: EXO allows ~3 detail calls/sec sustained; 350ms keeps us under the limit
-        # and avoids the GetResponseHeader crash in the EXO module's 429 retry handler
-        Start-Sleep -Milliseconds 350
-
-    } catch {
-        Write-Warning "Could not retrieve detail for message $($msg.MessageId): $_"
-    }
-}
-
-Write-Progress -Activity "Checking message detail" -Completed
-
-# ---------- Quarantine lookup (faster than message trace — no propagation delay) ----------
-Write-Host "`nStep 3/3 — Checking quarantine for transport rule matches..." -ForegroundColor Cyan
-try {
-    $quarantineHits = Get-QuarantineMessage -StartReceivedDate $StartDate `
-                                            -EndReceivedDate $EndDate `
-                                            -QuarantineTypes TransportRule `
-                                            -PageSize 1000 `
-                                            -ErrorAction Stop |
-        Where-Object { $_.PolicyName -like "*$RuleName*" }
-
-    if ($quarantineHits -and $quarantineHits.Count -gt 0) {
-        Write-Host "  Found $($quarantineHits.Count) quarantined message(s) matching rule '$RuleName'." -ForegroundColor Gray
-        foreach ($qMsg in $quarantineHits) {
-            # Avoid double-counting messages already found in message trace
-            $alreadyFound = $results | Where-Object {
-                $_.Sender -eq $qMsg.SenderAddress -and
-                $_.Recipient -eq $qMsg.RecipientAddress -and
-                [math]::Abs(($_.DateTime - $qMsg.ReceivedTime).TotalMinutes) -lt 2
-            }
-            if (-not $alreadyFound) {
-                $results.Add([PSCustomObject]@{
-                    Source     = 'Quarantine'
-                    DateTime   = $qMsg.ReceivedTime
-                    Sender     = $qMsg.SenderAddress
-                    Recipient  = $qMsg.RecipientAddress
-                    Subject    = $qMsg.Subject
-                    Status     = 'Quarantined'
-                    RuleAction = $qMsg.PolicyName
-                    MessageId  = $qMsg.Identity
+            $pageResults.Add([PSCustomObject]@{
+                    Source     = 'TransportRuleReport'
+                    DateTime   = Get-FirstPropertyValue $item @('Date', 'Received', 'ReceivedTime')
+                    Sender     = Get-FirstPropertyValue $item @('SenderAddress', 'Sender')
+                    Recipient  = $recipient
+                    Subject    = Get-FirstPropertyValue $item @('Subject')
+                    Status     = Get-FirstPropertyValue $item @('EventType', 'Status')
+                    RuleAction = $action
+                    MessageId  = $messageId
+                    MessageTraceId = $messageTraceId
                 })
             }
         }
-    } else {
-        Write-Host '  No quarantined messages matched.' -ForegroundColor Gray
-    }
-} catch {
-    Write-Warning "Quarantine lookup failed: $_"
+
+        if ($pageResults.Count -gt 0) {
+            if ($csvInitialized) {
+                $pageResults | Export-Csv -LiteralPath $partialCsv -NoTypeInformation -Encoding UTF8 -Append
+            } else {
+                $pageResults | Export-Csv -LiteralPath $partialCsv -NoTypeInformation -Encoding UTF8
+                $csvInitialized = $true
+                Write-Host "  Writing incremental results to: $partialCsv" -ForegroundColor Gray
+            }
+            $resultCount += $pageResults.Count
+
+            foreach ($result in $pageResults) { $recentResults.Add($result) }
+            if ($recentResults.Count -gt 15) {
+                $latest = @($recentResults | Sort-Object DateTime -Descending | Select-Object -First 15)
+                $recentResults.Clear()
+                foreach ($result in $latest) { $recentResults.Add($result) }
+            }
+        }
+
+        $windowCount += $batch.Count
+        if ($page -eq 1000 -and $batch.Count -eq 5000) {
+            if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
+            throw "The report reached its 5,000,000-row limit for a one-day window. Partial results remain at '$partialCsv'. Rerun with a shorter date range."
+        }
+        $page++
+    } while ($batch.Count -eq 5000)
+
+    Write-Host "  $($window.Start.ToString('yyyy-MM-dd HH:mm')) - $($window.End.ToString('yyyy-MM-dd HH:mm')): $windowCount action hit(s)" -ForegroundColor Gray
 }
-if ($results.Count -gt 0) {
-    $results | Sort-Object DateTime -Descending | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host "`nFound $($results.Count) message(s) affected by rule '$RuleName'." -ForegroundColor Green
+
+if ($resultCount -gt 0) {
+    Move-Item -LiteralPath $partialCsv -Destination $OutputCsv -Force
+    Write-Host "`nFound $resultCount message(s) affected by rule '$RuleName'." -ForegroundColor Green
     Write-Host "Results saved to: $OutputCsv" -ForegroundColor Green
 
     Write-Host "`n--- Most Recent Matches ---" -ForegroundColor Cyan
-    $results | Sort-Object DateTime -Descending | Select-Object -First 15 |
+    $recentResults | Sort-Object DateTime -Descending |
         Format-Table Source, DateTime, Sender, Recipient, Subject, Status -AutoSize
 } else {
-    Write-Host "`nNo messages matched rule '$RuleName' in the specified date range and status filter." -ForegroundColor Yellow
-    Write-Host "Tip: Try 'All' as the status filter if the rule silently deletes rather than rejects." -ForegroundColor Gray
-    Write-Host "Tip: If the message was very recent, message trace may not have propagated yet (5-30 min delay)." -ForegroundColor Gray
+    Write-Host "`nNo action hits matched rule '$RuleName' in the specified date range." -ForegroundColor Yellow
+    Write-Host 'Tip: Reporting data can take time to appear. Retry later if the message was very recent.' -ForegroundColor Gray
 }
 
 if ($connectedHere) { Disconnect-ExchangeOnline -Confirm:$false }
